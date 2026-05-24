@@ -1,4 +1,4 @@
-# Лабораторная работа 04. Проектирование и работа с MongoDB
+# Лабораторная работа 05. Оптимизация производительности через кеширование и rate limiting
 
 ## Дисциплина
 
@@ -10,16 +10,11 @@
 
 Приложение содержит основные сущности:
 
-- пользователь;
+- пользователь / исполнитель;
 - цель;
 - задача.
 
-PostgreSQL из лабораторной работы 3 остается основным хранилищем для
-`users`, `goals` и `tasks`. MongoDB добавлена для документных данных:
-
-- история активности задач;
-- комментарии к задачам;
-- журнал уведомлений.
+ЛР5 развивает результат ЛР4: REST API на C++20 / Yandex Userver продолжает использовать PostgreSQL 16 для `users`, `goals`, `tasks` и MongoDB 7 для `task_activity`, `task_comments`, `notification_log`. Новое в ЛР5: Redis 7, Cache-Aside кеширование горячих read endpoints и fixed-window rate limiting.
 
 ## Технологии
 
@@ -27,10 +22,9 @@ PostgreSQL из лабораторной работы 3 остается осн�
 - Yandex Userver;
 - PostgreSQL 16;
 - MongoDB 7;
+- Redis 7;
 - Docker Compose;
 - REST API.
-
-Redis и RabbitMQ в лабораторной работе 4 не используются.
 
 ## Структура проекта
 
@@ -40,7 +34,8 @@ Redis и RabbitMQ в лабораторной работе 4 не использ
 ├── Dockerfile
 ├── docker-compose.yaml
 ├── configs/
-│   └── static_config.yaml
+│   ├── static_config.yaml
+│   └── secdist.json
 ├── db/
 │   ├── schema.sql
 │   ├── data.sql
@@ -55,6 +50,7 @@ Redis и RabbitMQ в лабораторной работе 4 не использ
 │   └── curl_examples.md
 ├── schema_design.md
 ├── optimization.md
+├── performance_design.md
 └── openapi.yaml
 ```
 
@@ -62,7 +58,7 @@ Redis и RabbitMQ в лабораторной работе 4 не использ
 
 PostgreSQL хранит нормализованные основные сущности:
 
-- `users` - пользователи и роли;
+- `users` - пользователи, роли и данные авторизации;
 - `goals` - цели;
 - `tasks` - задачи цели, исполнитель, автор, статус и срок.
 
@@ -72,12 +68,17 @@ MongoDB использует базу `task_planning_mongo` и коллекци�
 - `task_comments` - комментарии к задаче;
 - `notification_log` - журнал уведомлений.
 
-Подробное описание документной модели, выбора коллекций и решения
-embedded vs references находится в [schema_design.md](schema_design.md).
+Redis используется как инфраструктурный слой:
+
+- `goals:all` - кеш ответа `GET /api/goals`, TTL 60 секунд;
+- `goal:{goalId}:tasks` - кеш ответа `GET /api/goals/{goalId}/tasks`, TTL 30 секунд;
+- `rate:user-search:{userId}:{windowStartUnixMinute}` - счетчик rate limiting для поиска пользователей.
+
+Подробное проектирование кеширования, rate limiting, hot paths, slow operations и метрик описано в [performance_design.md](performance_design.md).
 
 ## Запуск
 
-Собрать и запустить API, PostgreSQL и MongoDB:
+Собрать и запустить API, PostgreSQL, MongoDB и Redis:
 
 ```bash
 docker compose up --build
@@ -89,7 +90,7 @@ API доступен по адресу:
 http://localhost:8080
 ```
 
-Если порт `8080` уже занят другим контейнером, можно выбрать другой host-порт:
+Если порт `8080` занят, можно выбрать другой host-порт:
 
 ```bash
 API_PORT=18080 docker compose up --build
@@ -102,10 +103,149 @@ $env:API_PORT = "18080"
 docker compose up --build
 ```
 
-Тогда API будет доступен по адресу `http://localhost:18080`.
+В README основной адрес остается `http://localhost:8080`.
 
-MongoDB не публикует порт на host и доступна внутри compose-сети как сервис
-`mongo`. Скрипты из папки `mongo/` монтируются в контейнер по пути `/scripts`.
+## API endpoints
+
+| Метод | URL | Назначение | Auth |
+|---|---|---|---|
+| GET | `/ping` | Проверка сервиса | Нет |
+| POST | `/api/users` | Создание пользователя | Нет |
+| POST | `/api/auth/login` | Получение bearer token | Нет |
+| GET | `/api/users/by-login?login=alexey` | Поиск пользователя по логину | Да |
+| GET | `/api/users/search?mask=iv` | Поиск пользователей по имени/фамилии, rate limited | Да |
+| POST | `/api/goals` | Создание цели, инвалидирует `goals:all` | Да |
+| GET | `/api/goals` | Получение целей, `X-Cache: HIT/MISS` | Да |
+| POST | `/api/goals/{goalId}/tasks` | Создание задачи, инвалидирует `goal:{goalId}:tasks` | Да |
+| GET | `/api/goals/{goalId}/tasks` | Получение задач цели, `X-Cache: HIT/MISS` | Да |
+| PATCH | `/api/goals/{goalId}/tasks/{taskId}/status` | Изменение статуса, инвалидирует `goal:{goalId}:tasks` | Да |
+| POST | `/api/goals/{goalId}/tasks/{taskId}/comments` | Добавить комментарий к задаче | Да |
+| GET | `/api/goals/{goalId}/tasks/{taskId}/comments` | Получить комментарии задачи из MongoDB | Да |
+| GET | `/api/goals/{goalId}/tasks/{taskId}/activity` | Получить историю активности задачи из MongoDB | Да |
+
+Учебная авторизация сохранена: после login API возвращает bearer token вида `token-{userId}`.
+
+## Проверка API
+
+Проверить сервис:
+
+```bash
+curl http://localhost:8080/ping
+```
+
+Получить токен seed-пользователя `alexey/pass123`:
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"login":"alexey","password":"pass123"}' | sed -E 's/.*"token":"([^"]+)".*/\1/')
+```
+
+В PowerShell:
+
+```powershell
+$login = curl.exe -s -X POST http://localhost:8080/api/auth/login `
+  -H "Content-Type: application/json" `
+  -d '{\"login\":\"alexey\",\"password\":\"pass123\"}' | ConvertFrom-Json
+$env:TOKEN = $login.token
+```
+
+Проверить кеш `GET /api/goals`: первый запрос должен вернуть `X-Cache: MISS`, второй - `X-Cache: HIT`.
+
+```bash
+curl -i http://localhost:8080/api/goals \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -i http://localhost:8080/api/goals \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Проверить кеш `GET /api/goals/1/tasks`: первый запрос должен вернуть `X-Cache: MISS`, второй - `X-Cache: HIT`.
+
+```bash
+curl -i http://localhost:8080/api/goals/1/tasks \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -i http://localhost:8080/api/goals/1/tasks \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Проверить инвалидацию `goals:all` после создания цели:
+
+```bash
+curl -i -X POST http://localhost:8080/api/goals \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"title":"Cache invalidation check","description":"Goal created to invalidate goals:all"}'
+
+curl -i http://localhost:8080/api/goals \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+После `POST /api/goals` следующий `GET /api/goals` должен снова вернуть `X-Cache: MISS`.
+
+Проверить инвалидацию `goal:1:tasks` после создания задачи:
+
+```bash
+curl -i -X POST http://localhost:8080/api/goals/1/tasks \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"title":"Cache invalidation task","description":"Task created to invalidate goal:1:tasks","assigneeId":2,"dueDate":"2026-06-30"}'
+
+curl -i http://localhost:8080/api/goals/1/tasks \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+После `POST /api/goals/1/tasks` следующий `GET /api/goals/1/tasks` должен снова вернуть `X-Cache: MISS`.
+
+Проверить инвалидацию `goal:1:tasks` после изменения статуса:
+
+```bash
+curl -i -X PATCH http://localhost:8080/api/goals/1/tasks/1/status \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"status":"in_progress"}'
+
+curl -i http://localhost:8080/api/goals/1/tasks \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## Rate limiting
+
+`GET /api/users/search?mask=...` ограничен 60 запросами в минуту на авторизованного пользователя. Каждый ответ endpoint добавляет заголовки:
+
+- `X-RateLimit-Limit`;
+- `X-RateLimit-Remaining`;
+- `X-RateLimit-Reset`.
+
+При превышении лимита API возвращает:
+
+```http
+HTTP/1.1 429 Too Many Requests
+```
+
+```json
+{"error":"rate limit exceeded"}
+```
+
+Тест превышения лимита:
+
+```bash
+for i in $(seq 1 65); do
+  curl -i -s http://localhost:8080/api/users/search?mask=iv \
+    -H "Authorization: Bearer $TOKEN" | grep -E "HTTP/|X-RateLimit|rate limit"
+done
+```
+
+В PowerShell:
+
+```powershell
+1..65 | ForEach-Object {
+  curl.exe -i -s "http://localhost:8080/api/users/search?mask=iv" `
+    -H "Authorization: Bearer $env:TOKEN" |
+    Select-String -Pattern "HTTP/|X-RateLimit|rate limit"
+}
+```
 
 ## MongoDB scripts
 
@@ -115,7 +255,7 @@ MongoDB не публикует порт на host и доступна внут�
 docker compose exec mongo mongosh /scripts/validation.js
 ```
 
-Загрузить тестовые документы, по 10 документов в каждую коллекцию:
+Загрузить тестовые документы:
 
 ```bash
 docker compose exec mongo mongosh /scripts/data.js
@@ -127,100 +267,12 @@ docker compose exec mongo mongosh /scripts/data.js
 docker compose exec mongo mongosh /scripts/queries.js
 ```
 
-`queries.js` содержит create/read/update/delete операции с операторами `$eq`,
-`$ne`, `$gt`, `$lt`, `$in`, `$and`, `$or`, `$addToSet`, `$pull`, а также
-aggregation pipeline с группировкой `task_activity` по `taskId` и `type`.
-
-## API endpoints
-
-Базовые endpoints PostgreSQL из лабораторной 3 сохранены:
-
-| Метод | URL | Назначение | Auth |
-|---|---|---|---|
-| GET | `/ping` | Проверка сервиса | Нет |
-| POST | `/api/users` | Создание пользователя | Нет |
-| POST | `/api/auth/login` | Получение bearer token | Нет |
-| GET | `/api/users/by-login?login=alexey` | Поиск пользователя по логину | Да |
-| GET | `/api/users/search?mask=iv` | Поиск пользователей по имени/фамилии | Да |
-| POST | `/api/goals` | Создание цели | Да |
-| GET | `/api/goals` | Получение целей | Да |
-| POST | `/api/goals/{goalId}/tasks` | Создание задачи в цели | Да |
-| GET | `/api/goals/{goalId}/tasks` | Получение задач цели | Да |
-| PATCH | `/api/goals/{goalId}/tasks/{taskId}/status` | Изменение статуса задачи | Да |
-
-Новые endpoints лабораторной 4:
-
-| Метод | URL | Назначение | Хранилище |
-|---|---|---|---|
-| POST | `/api/goals/{goalId}/tasks/{taskId}/comments` | Добавить комментарий к задаче | MongoDB |
-| GET | `/api/goals/{goalId}/tasks/{taskId}/comments` | Получить комментарии задачи | MongoDB |
-| GET | `/api/goals/{goalId}/tasks/{taskId}/activity` | Получить историю активности задачи | MongoDB |
-
-При успешном `PATCH /api/goals/{goalId}/tasks/{taskId}/status` API обновляет
-статус задачи в PostgreSQL и добавляет событие `status_changed` в MongoDB:
-
-```json
-{
-  "taskId": 1,
-  "goalId": 1,
-  "type": "status_changed",
-  "actor": { "userId": 1 },
-  "payload": { "newStatus": "in_progress" },
-  "createdAt": "2026-05-24T10:00:00Z"
-}
-```
-
-## Проверка API
-
-Проверить сервис:
-
-```bash
-curl http://localhost:8080/ping
-```
-
-Получить учебный bearer token для seed-пользователя:
-
-```bash
-TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"login":"alexey","password":"pass123"}' | sed -E 's/.*"token":"([^"]+)".*/\1/')
-```
-
-Получить задачи цели из PostgreSQL:
-
-```bash
-curl -i http://localhost:8080/api/goals/1/tasks \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-Добавить комментарий к задаче в MongoDB:
-
-```bash
-curl -i -X POST http://localhost:8080/api/goals/1/tasks/1/comments \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"text":"Комментарий из API лабораторной 4","tags":["api","mongo"]}'
-```
-
-Получить комментарии задачи:
+Проверить MongoDB endpoints из ЛР4:
 
 ```bash
 curl -i http://localhost:8080/api/goals/1/tasks/1/comments \
   -H "Authorization: Bearer $TOKEN"
-```
 
-Изменить статус задачи и записать событие в `task_activity`:
-
-```bash
-curl -i -X PATCH http://localhost:8080/api/goals/1/tasks/1/status \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"status":"in_progress"}'
-```
-
-Получить историю активности задачи:
-
-```bash
 curl -i http://localhost:8080/api/goals/1/tasks/1/activity \
   -H "Authorization: Bearer $TOKEN"
 ```

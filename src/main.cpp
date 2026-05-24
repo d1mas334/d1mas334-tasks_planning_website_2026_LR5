@@ -32,6 +32,12 @@
 #include <userver/storages/postgres/cluster.hpp>
 #include <userver/storages/postgres/component.hpp>
 #include <userver/storages/postgres/result_set.hpp>
+#include <userver/storages/redis/client.hpp>
+#include <userver/storages/redis/component.hpp>
+#include <userver/storages/redis/command_control.hpp>
+#include <userver/storages/redis/exception.hpp>
+#include <userver/storages/secdist/component.hpp>
+#include <userver/storages/secdist/provider_component.hpp>
 #include <userver/testsuite/testsuite_support.hpp>
 #include <userver/utils/datetime.hpp>
 #include <userver/utils/daemon_run.hpp>
@@ -47,6 +53,7 @@ namespace json = userver::formats::json;
 namespace mongo = userver::storages::mongo;
 namespace mongo_options = userver::storages::mongo::options;
 namespace postgres = userver::storages::postgres;
+namespace redis = userver::storages::redis;
 namespace server = userver::server;
 namespace datetime = userver::utils::datetime;
 
@@ -483,6 +490,93 @@ struct ApiError {
   std::string message;
 };
 
+struct RateLimitResult {
+  bool allowed{};
+  std::int64_t limit{};
+  std::int64_t remaining{};
+  std::int64_t reset_unix_timestamp{};
+};
+
+class RedisStorage final : public components::ComponentBase {
+ public:
+  static constexpr std::string_view kName = "redis-storage";
+
+  RedisStorage(const components::ComponentConfig& config,
+               const components::ComponentContext& context)
+      : ComponentBase(config, context),
+        redis_client_(
+            context.FindComponent<components::Redis>("task-planning-cache")
+                .GetClient("task-planning-cache")),
+        redis_cc_{std::chrono::milliseconds{100},
+                  std::chrono::milliseconds{300}, 1} {}
+
+  std::optional<std::string> GetJson(const std::string& key) const {
+    try {
+      return redis_client_->Get(key, redis_cc_).Get("cache get " + key);
+    } catch (const redis::Exception& error) {
+      LOG_WARNING() << "Redis cache get failed for key=" << key
+                    << ": " << error.what();
+      return std::nullopt;
+    }
+  }
+
+  void SetJson(const std::string& key, const std::string& value,
+               std::chrono::seconds ttl) const {
+    try {
+      redis_client_->Setex(key, ttl, value, redis_cc_).Get("cache set " + key);
+    } catch (const redis::Exception& error) {
+      LOG_WARNING() << "Redis cache set failed for key=" << key
+                    << ": " << error.what();
+    }
+  }
+
+  void Invalidate(const std::string& key) const {
+    try {
+      redis_client_->Del(key, redis_cc_).Get("cache del " + key);
+    } catch (const redis::Exception& error) {
+      LOG_WARNING() << "Redis cache invalidation failed for key=" << key
+                    << ": " << error.what();
+    }
+  }
+
+  RateLimitResult CheckUserSearchRateLimit(std::int64_t user_id) const {
+    constexpr std::int64_t kLimit = 60;
+    constexpr auto kWindow = std::chrono::seconds{60};
+
+    const auto now = std::chrono::system_clock::now();
+    const auto now_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                                 now.time_since_epoch())
+                                 .count();
+    const auto window_start_unix_minute = now_seconds / kWindow.count();
+    const auto reset_unix_timestamp =
+        (window_start_unix_minute + 1) * kWindow.count();
+    const auto key = "rate:user-search:" + std::to_string(user_id) + ":" +
+                     std::to_string(window_start_unix_minute);
+
+    try {
+      const auto current =
+          redis_client_->Incr(key, redis_cc_).Get("rate limit incr " + key);
+      if (current == 1) {
+        redis_client_->Expire(key, kWindow, redis_cc_)
+            .Get("rate limit expire " + key);
+      }
+
+      return RateLimitResult{current <= kLimit, kLimit,
+                             std::max<std::int64_t>(0, kLimit - current),
+                             reset_unix_timestamp};
+    } catch (const redis::Exception& error) {
+      LOG_ERROR() << "Redis rate limiter failed for key=" << key
+                  << ": " << error.what();
+      throw ApiError{http::HttpStatus::kServiceUnavailable,
+                     "rate limiter unavailable"};
+    }
+  }
+
+ private:
+  redis::ClientPtr redis_client_;
+  redis::CommandControl redis_cc_;
+};
+
 json::ValueBuilder BuildError(std::string_view message) {
   json::ValueBuilder builder;
   builder["error"] = std::string{message};
@@ -648,10 +742,42 @@ std::string MakeJsonResponse(const http::HttpRequest& request,
   return json::ToString(builder.ExtractValue());
 }
 
+std::string MakeJsonStringResponse(const http::HttpRequest& request,
+                                   http::HttpStatus status,
+                                   std::string body) {
+  request.SetResponseStatus(status);
+  request.GetHttpResponse().SetHeader(std::string_view{"Content-Type"},
+                                      std::string{"application/json"});
+  return body;
+}
+
 std::string MakeErrorResponse(const http::HttpRequest& request,
                               http::HttpStatus status,
                               std::string_view message) {
   return MakeJsonResponse(request, status, BuildError(message));
+}
+
+void SetResponseHeader(const http::HttpRequest& request, std::string_view name,
+                       std::string value) {
+  request.GetHttpResponse().SetHeader(name, std::move(value));
+}
+
+void SetCacheHeader(const http::HttpRequest& request, std::string_view value) {
+  SetResponseHeader(request, "X-Cache", std::string{value});
+}
+
+void SetRateLimitHeaders(const http::HttpRequest& request,
+                         const RateLimitResult& rate_limit) {
+  SetResponseHeader(request, "X-RateLimit-Limit",
+                    std::to_string(rate_limit.limit));
+  SetResponseHeader(request, "X-RateLimit-Remaining",
+                    std::to_string(rate_limit.remaining));
+  SetResponseHeader(request, "X-RateLimit-Reset",
+                    std::to_string(rate_limit.reset_unix_timestamp));
+}
+
+std::string MakeGoalTasksCacheKey(std::int64_t goal_id) {
+  return "goal:" + std::to_string(goal_id) + ":tasks";
 }
 
 json::Value ParseJsonObjectBody(const http::HttpRequest& request) {
@@ -799,7 +925,8 @@ class ApiHandlerBase : public handlers::HttpHandlerBase {
                  const components::ComponentContext& context)
       : HttpHandlerBase(config, context),
         storage_(context.FindComponent<PostgresStorage>()),
-        mongo_storage_(context.FindComponent<MongoStorage>()) {}
+        mongo_storage_(context.FindComponent<MongoStorage>()),
+        redis_storage_(context.FindComponent<RedisStorage>()) {}
 
   std::string HandleRequestThrow(
       const http::HttpRequest& request,
@@ -837,6 +964,7 @@ class ApiHandlerBase : public handlers::HttpHandlerBase {
 
   PostgresStorage& storage_;
   MongoStorage& mongo_storage_;
+  RedisStorage& redis_storage_;
 };
 
 class PingHandler final : public ApiHandlerBase {
@@ -949,7 +1077,13 @@ class UserSearchHandler final : public ApiHandlerBase {
   std::string HandleApiRequest(
       const http::HttpRequest& request,
       server::request::RequestContext&) const override {
-    RequireAuth(request);
+    const auto user_id = RequireAuth(request);
+    const auto rate_limit = redis_storage_.CheckUserSearchRateLimit(user_id);
+    SetRateLimitHeaders(request, rate_limit);
+    if (!rate_limit.allowed) {
+      return MakeErrorResponse(request, http::HttpStatus::kTooManyRequests,
+                               "rate limit exceeded");
+    }
 
     const auto& mask = request.GetArg("mask");
     if (mask.empty()) {
@@ -978,18 +1112,30 @@ class GoalsHandler final : public ApiHandlerBase {
     const auto author_id = RequireAuth(request);
 
     if (request.GetMethod() == http::HttpMethod::kGet) {
+      constexpr std::string_view kCacheKey = "goals:all";
+      if (const auto cached = redis_storage_.GetJson(std::string{kCacheKey})) {
+        SetCacheHeader(request, "HIT");
+        return MakeJsonStringResponse(request, http::HttpStatus::kOk, *cached);
+      }
+
       json::ValueBuilder goals(formats::common::Type::kArray);
       for (const auto& goal : storage_.ListGoals()) {
         goals.PushBack(BuildGoal(goal));
       }
-      return MakeJsonResponse(request, http::HttpStatus::kOk,
-                              std::move(goals));
+
+      auto body = json::ToString(goals.ExtractValue());
+      redis_storage_.SetJson(std::string{kCacheKey}, body,
+                             std::chrono::seconds{60});
+      SetCacheHeader(request, "MISS");
+      return MakeJsonStringResponse(request, http::HttpStatus::kOk,
+                                    std::move(body));
     }
 
     const auto body = ParseJsonObjectBody(request);
     const auto title = GetRequiredString(body, "title");
     const auto description = GetRequiredString(body, "description");
     const auto goal = storage_.CreateGoal(title, description, author_id);
+    redis_storage_.Invalidate("goals:all");
 
     return MakeJsonResponse(request, http::HttpStatus::kCreated,
                             BuildGoal(goal));
@@ -1008,17 +1154,31 @@ class GoalTasksHandler final : public ApiHandlerBase {
     const auto author_id = RequireAuth(request);
     const auto goal_id = ParsePositiveId(request.GetPathArg("goalId"), "goalId");
 
-    if (!storage_.FindGoalById(goal_id).has_value()) {
-      throw ApiError{http::HttpStatus::kNotFound, "goal not found"};
-    }
-
     if (request.GetMethod() == http::HttpMethod::kGet) {
+      const auto cache_key = MakeGoalTasksCacheKey(goal_id);
+      if (const auto cached = redis_storage_.GetJson(cache_key)) {
+        SetCacheHeader(request, "HIT");
+        return MakeJsonStringResponse(request, http::HttpStatus::kOk, *cached);
+      }
+
+      if (!storage_.FindGoalById(goal_id).has_value()) {
+        throw ApiError{http::HttpStatus::kNotFound, "goal not found"};
+      }
+
       json::ValueBuilder tasks(formats::common::Type::kArray);
       for (const auto& task : storage_.ListTasks(goal_id)) {
         tasks.PushBack(BuildTask(task));
       }
-      return MakeJsonResponse(request, http::HttpStatus::kOk,
-                              std::move(tasks));
+
+      auto body = json::ToString(tasks.ExtractValue());
+      redis_storage_.SetJson(cache_key, body, std::chrono::seconds{30});
+      SetCacheHeader(request, "MISS");
+      return MakeJsonStringResponse(request, http::HttpStatus::kOk,
+                                    std::move(body));
+    }
+
+    if (!storage_.FindGoalById(goal_id).has_value()) {
+      throw ApiError{http::HttpStatus::kNotFound, "goal not found"};
     }
 
     const auto body = ParseJsonObjectBody(request);
@@ -1041,6 +1201,7 @@ class GoalTasksHandler final : public ApiHandlerBase {
     if (!task.has_value()) {
       throw ApiError{http::HttpStatus::kNotFound, "goal or assignee not found"};
     }
+    redis_storage_.Invalidate(MakeGoalTasksCacheKey(goal_id));
 
     return MakeJsonResponse(request, http::HttpStatus::kCreated,
                             BuildTask(*task));
@@ -1076,6 +1237,7 @@ class TaskStatusHandler final : public ApiHandlerBase {
       throw ApiError{http::HttpStatus::kNotFound, "task not found"};
     }
 
+    redis_storage_.Invalidate(MakeGoalTasksCacheKey(goal_id));
     mongo_storage_.AddStatusChangedActivity(goal_id, task_id, actor_id, status);
 
     return MakeJsonResponse(request, http::HttpStatus::kOk, BuildTask(*task));
@@ -1165,10 +1327,14 @@ int main(int argc, char* argv[]) {
       userver::components::MinimalServerComponentList()
           .Append<userver::components::TestsuiteSupport>()
           .Append<userver::clients::dns::Component>()
+          .Append<userver::components::Secdist>()
+          .Append<userver::components::DefaultSecdistProvider>()
           .Append<userver::components::Postgres>("task-planning-db")
           .Append<userver::components::Mongo>("task-planning-mongo")
+          .Append<userver::components::Redis>("task-planning-cache")
           .Append<task_planning::PostgresStorage>()
           .Append<task_planning::MongoStorage>()
+          .Append<task_planning::RedisStorage>()
           .Append<task_planning::PingHandler>()
           .Append<task_planning::UsersHandler>()
           .Append<task_planning::LoginHandler>()
