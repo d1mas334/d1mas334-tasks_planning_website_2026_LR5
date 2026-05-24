@@ -22,6 +22,13 @@ components_manager:
 
     dns-client: {}
 
+    secdist:
+      provider: default-secdist-provider
+
+    default-secdist-provider:
+      config: /app/configs/secdist.json
+      missing-ok: false
+
     task-planning-db:
       dbconnection: 'postgresql://task_planning:task_planning@postgres:5432/task_planning'
       blocking_task_processor: fs-task-processor
@@ -44,9 +51,21 @@ components_manager:
       maintenance_period: 15s
       stats_verbosity: terse
 
+    task-planning-cache:
+      groups:
+        - config_name: task-planning-cache
+          db: task-planning-cache
+          sharding_strategy: RedisStandalone
+      subscribe_groups: []
+      thread_pools:
+        redis_thread_pool_size: 2
+        sentinel_thread_pool_size: 1
+
     postgres-storage: {}
 
     mongo-storage: {}
+
+    redis-storage: {}
 
     testsuite-support: {}
 
